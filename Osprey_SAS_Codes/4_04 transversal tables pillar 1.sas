@@ -1,0 +1,87 @@
+%MACRO PILLAR1;
+
+/*Summarize GWP records from PR_GR_PSEA*/
+PROC SUMMARY NWAY 
+      DATA = TRANSV.PR_GR_PSEA(WHERE=(yrm<=&acc_yrm AND (GWP NE 0 OR CWP NE 0)));
+      CLASS CHDRNUM TRANNO RSKNO YRM AGENTID BATCBRN TRANTYPE;
+      VAR GWP CWP;
+      OUTPUT OUT=PREMIUM(DROP=_:) SUM=;
+RUN;
+
+/*Merge Premium Summary with Pol History, by Tranno - This to get the ZRENNO*/
+PROC SORT
+      DATA=TRANSV.POLHISTORY_PSEA(KEEP=CHDRNUM TRANNO ZRENNO)
+      OUT=POLHIST;
+      BY CHDRNUM TRANNO;
+RUN;
+
+DATA PREMIUM2;
+      MERGE PREMIUM(IN=A) POLHIST;
+      BY CHDRNUM TRANNO;
+      IF A;
+      /*Amend the Transaction Type to be NB if the endorsement is subsequent to an NB and same for RE*/
+      ALL_GWP_NB = (GWP - CWP)*(ZRENNO = 0);
+      ALL_GWP_RE = (GWP - CWP)*(ZRENNO > 0);
+      /*Count 1 Risk booked, only if it is an issuance transaction*/
+      NBRISK_NB = (TRANTYPE IN ("NB","RN"))*(ZRENNO = 0)*1;
+      NBRISK_RE = (TRANTYPE IN ("NB","RN"))*(ZRENNO > 0)*1;
+RUN;
+
+PROC SUMMARY NWAY MISSING
+      DATA=PREMIUM2;
+      CLASS CHDRNUM TRANNO RSKNO ZRENNO YRM AGENTID BATCBRN;
+      VAR ALL_GWP_: NBRISK_:;
+      OUTPUT OUT=PREMIUM3(DROP=_:) SUM=;
+RUN;
+
+/*Merge by Tranno with RISKPF, and output the errors if mismatch (Cancellations & Reinstatements)*/
+
+PROC SORT 
+      DATA = EXTRACT.RISKPF(KEEP=CHDRNO TRANNO RSKNO DATIME RECFORMAT)
+      OUT  = RISKPF(DROP=DATIME);
+      BY CHDRNO TRANNO RSKNO DESCENDING DATIME;
+RUN;
+PROC SORT NODUPKEYS
+      OUT  = RISKPF;
+      BY CHDRNO TRANNO RSKNO;
+RUN;
+
+DATA RISKPF2;
+      MERGE RISKPF(IN=A RENAME=(CHDRNO=CHDRNUM)) POLHIST(IN=B);
+      BY CHDRNUM TRANNO;
+      IF A AND B;
+	  rsktabl = SUBSTR(recformat, 1, LENGTH(recformat) - 3);
+	  DROP RECFORMAT;
+RUN;
+
+DATA P1 ERROR;
+      MERGE PREMIUM3(IN=A) RISKPF2(IN=B);
+      BY CHDRNUM TRANNO RSKNO;
+      IF (A AND B) THEN OUTPUT P1;
+      IF (A AND NOT B) THEN OUTPUT ERROR;
+RUN;
+
+/*Amend the errors, by attributing the latest tranno in the same POI, just before the missing tranno*/
+PROC SQL;
+      CREATE TABLE ERROR2 AS
+      SELECT T1.*, T2.TRANNO AS TRANNO_RISK LABEL="TRANNO_RISK", T2.rsktabl
+      FROM ERROR(DROP=rsktabl) AS T1 LEFT JOIN RISKPF2 AS T2
+      ON T1.CHDRNUM=T2.CHDRNUM AND T1.RSKNO=T2.RSKNO AND T1.ZRENNO=T2.ZRENNO AND T1.TRANNO>=T2.TRANNO;
+QUIT;
+PROC SORT;
+      BY CHDRNUM RSKNO TRANNO DESCENDING TRANNO_RISK;
+RUN;
+PROC SORT NODUPKEYS;
+      BY CHDRNUM RSKNO TRANNO;
+RUN;
+
+DATA TRANSV.P1;
+      SET P1(IN=A) ERROR2(IN=B);
+      IF A THEN TRANNO_RISK=TRANNO;
+RUN;
+
+PROC SORT;
+      BY CHDRNUM RSKNO TRANNO;
+RUN;
+
+%MEND;
